@@ -1,21 +1,23 @@
 import logging
-import os
 from pprint import pformat
 from typing import Union, List
 
 import pandas as pd
 import yaml
 
-from ludwig.backend import Backend, initialize_backend
+from ludwig.callbacks import Callback
+from ludwig.hyperopt.execution import executor_registry
+from ludwig.backend import Backend, initialize_backend, LocalBackend
 from ludwig.constants import HYPEROPT, TRAINING, VALIDATION, TEST, COMBINED, \
-    LOSS, TYPE, RAY
+    LOSS, TYPE, SAMPLER, EXECUTOR, MINIMIZE
 from ludwig.features.feature_registries import output_type_registry
 from ludwig.hyperopt.execution import get_build_hyperopt_executor
-from ludwig.hyperopt.sampling import get_build_hyperopt_sampler
-from ludwig.hyperopt.utils import update_hyperopt_params_with_defaults, \
-    print_hyperopt_results, save_hyperopt_stats
+from ludwig.hyperopt.results import HyperoptResults
+from ludwig.hyperopt.sampling import get_build_hyperopt_sampler, sampler_registry
+from ludwig.hyperopt.utils import print_hyperopt_results, save_hyperopt_stats
 from ludwig.utils.defaults import default_random_seed, merge_with_defaults
-from ludwig.utils.misc_utils import get_from_registry
+from ludwig.utils.fs_utils import open_file, makedirs
+from ludwig.utils.misc_utils import get_from_registry, set_default_value, set_default_values, get_class_attributes
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +46,12 @@ def hyperopt(
         gpus: Union[str, int, List[int]] = None,
         gpu_memory_limit: int = None,
         allow_parallel_threads: bool = True,
+        callbacks: List[Callback] = None,
         backend: Union[Backend, str] = None,
         random_seed: int = default_random_seed,
         debug: bool = False,
         **kwargs,
-) -> List[dict]:
+) -> HyperoptResults:
     """This method performs an hyperparameter optimization.
 
     # Inputs
@@ -132,6 +135,9 @@ def hyperopt(
     :param allow_parallel_threads: (bool, default: `True`) allow TensorFlow
         to use multithreading parallelism to improve performance at
         the cost of determinism.
+    :param callbacks: (list, default: `None`) a list of
+        `ludwig.callbacks.Callback` objects that provide hooks into the
+        Ludwig pipeline.
     :param backend: (Union[Backend, str]) `Backend` or string name
         of backend to use to execute preprocessing / training steps.
     :param random_seed: (int: default: 42) random seed used for weights
@@ -141,16 +147,22 @@ def hyperopt(
 
     # Return
 
-    :return: (List[dict]) The results for the hyperparameter optimization
+    :return: (List[dict]) List of results for each trial, ordered by
+        descending performance on the target metric.
     """
-    backend = initialize_backend(backend)
-
     # check if config is a path or a dict
     if isinstance(config, str):  # assume path
-        with open(config, 'r') as def_file:
+        with open_file(config, 'r') as def_file:
             config_dict = yaml.safe_load(def_file)
     else:
         config_dict = config
+
+    # Explicitly default to a local backend to avoid picking up Ray or Horovod
+    # backend from the environment.
+    backend = backend or config_dict.get('backend') or 'local'
+    backend = initialize_backend(backend)
+    if not isinstance(backend, LocalBackend):
+        raise ValueError('Hyperopt requires using a `local` backend at this time.')
 
     # merge config with defaults
     config = merge_with_defaults(config_dict)
@@ -265,6 +277,10 @@ def hyperopt(
         executor[TYPE]
     )(hyperopt_sampler, output_feature, metric, split, **executor)
 
+    if callbacks:
+        for callback in callbacks:
+            callback.on_hyperopt_init(experiment_name)
+
     hyperopt_results = hyperopt_executor.execute(
         config,
         dataset=dataset,
@@ -290,6 +306,7 @@ def hyperopt(
         gpus=gpus,
         gpu_memory_limit=gpu_memory_limit,
         allow_parallel_threads=allow_parallel_threads,
+        callbacks=callbacks,
         backend=backend,
         random_seed=random_seed,
         debug=debug,
@@ -300,12 +317,11 @@ def hyperopt(
         print_hyperopt_results(hyperopt_results)
 
         if not skip_save_hyperopt_statistics:
-            if not os.path.exists(output_directory):
-                os.makedirs(output_directory)
+            makedirs(output_directory, exist_ok=True)
 
             hyperopt_stats = {
                 'hyperopt_config': hyperopt_config,
-                'hyperopt_results': hyperopt_results
+                'hyperopt_results': [t.to_dict() for t in hyperopt_results.ordered_trials],
             }
 
             save_hyperopt_stats(hyperopt_stats, output_directory)
@@ -314,3 +330,32 @@ def hyperopt(
     logger.info('Finished hyperopt')
 
     return hyperopt_results
+
+
+def update_hyperopt_params_with_defaults(hyperopt_params):
+    set_default_value(hyperopt_params, SAMPLER, {})
+    set_default_value(hyperopt_params, EXECUTOR, {})
+    set_default_value(hyperopt_params, "split", VALIDATION)
+    set_default_value(hyperopt_params, "output_feature", COMBINED)
+    set_default_value(hyperopt_params, "metric", LOSS)
+    set_default_value(hyperopt_params, "goal", MINIMIZE)
+
+    set_default_values(hyperopt_params[SAMPLER], {TYPE: "random"})
+
+    sampler = get_from_registry(hyperopt_params[SAMPLER][TYPE],
+                                sampler_registry)
+    sampler_defaults = {k: v for k, v in sampler.__dict__.items() if
+                        k in get_class_attributes(sampler)}
+    set_default_values(
+        hyperopt_params[SAMPLER], sampler_defaults,
+    )
+
+    set_default_values(hyperopt_params[EXECUTOR], {TYPE: "serial"})
+
+    executor = get_from_registry(hyperopt_params[EXECUTOR][TYPE],
+                                 executor_registry)
+    executor_defaults = {k: v for k, v in executor.__dict__.items() if
+                         k in get_class_attributes(executor)}
+    set_default_values(
+        hyperopt_params[EXECUTOR], executor_defaults,
+    )

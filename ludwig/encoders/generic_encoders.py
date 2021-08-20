@@ -18,21 +18,25 @@ import logging
 
 from tensorflow.keras.layers import Layer
 
+from torch.nn import Module
+from ludwig.utils.torch_utils import LudwigModule
+
 from ludwig.modules.fully_connected_modules import FCStack
 
 logger = logging.getLogger(__name__)
 
 
-class PassthroughEncoder(Layer):
+class PassthroughEncoder(LudwigModule):
 
     def __init__(
             self,
             **kwargs
     ):
-        super(PassthroughEncoder, self).__init__()
+        self.name = "PassthroughEncoder"
+        super().__init__()
         logger.debug(' {}'.format(self.name))
 
-    def call(self, inputs, training=None, mask=None):
+    def forward(self, inputs, training=None, mask=None):
         """
             :param inputs: The inputs fed into the encoder.
                    Shape: [batch x 1], type tf.float32
@@ -40,15 +44,16 @@ class PassthroughEncoder(Layer):
         return {'encoder_output': inputs}
 
 
-class DenseEncoder(Layer):
+class DenseEncoder(LudwigModule):
 
     def __init__(
             self,
+            input_size,
             layers=None,
             num_layers=1,
             fc_size=256,
             use_bias=True,
-            weights_initializer='glorot_uniform',
+            weights_initializer='xavier_uniform',
             bias_initializer='zeros',
             weights_regularizer=None,
             bias_regularizer=None,
@@ -61,11 +66,13 @@ class DenseEncoder(Layer):
             dropout=0,
             **kwargs
     ):
-        super(DenseEncoder, self).__init__()
+        super().__init__()
+        self.name = 'DenseEncoder'
         logger.debug(' {}'.format(self.name))
 
         logger.debug('  FCStack')
         self.fc_stack = FCStack(
+            first_layer_input_size=input_size,
             layers=layers,
             num_layers=num_layers,
             default_fc_size=fc_size,
@@ -83,7 +90,7 @@ class DenseEncoder(Layer):
             default_dropout=dropout,
         )
 
-    def call(self, inputs, training=None, mask=None):
+    def forward(self, inputs, training=None, mask=None):
         """
             :param inputs: The inputs fed into the encoder.
                    Shape: [batch x 1], type tf.float32

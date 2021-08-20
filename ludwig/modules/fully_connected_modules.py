@@ -18,16 +18,22 @@ import logging
 from tensorflow.keras.layers import (Activation, BatchNormalization, Dense,
                                      Dropout, Layer, LayerNormalization)
 
+from torch.nn import (Linear, LayerNorm, Module, Dropout, ModuleList)
+
+from ludwig.utils.torch_utils import (LudwigModule, initializers, activations, reg_loss)
+
 logger = logging.getLogger(__name__)
 
 
-class FCLayer(Layer):
+
+class FCLayer(LudwigModule):
 
     def __init__(
             self,
-            fc_size=256,
+            input_size,
+            output_size=256,
             use_bias=True,
-            weights_initializer='glorot_uniform',
+            weights_initializer='xavier_uniform',
             bias_initializer='zeros',
             weights_regularizer=None,
             bias_regularizer=None,
@@ -39,10 +45,12 @@ class FCLayer(Layer):
             activation='relu',
             dropout=0,
     ):
-        super(FCLayer, self).__init__()
+        super().__init__()
 
-        self.layers = []
+        #self.layers = []
+        self.layers = ModuleList()
 
+        '''
         self.layers.append(Dense(
             units=fc_size,
             use_bias=use_bias,
@@ -54,40 +62,82 @@ class FCLayer(Layer):
             # weights_constraint=weights_constraint,
             # bias_constraint=bias_constraint,
         ))
+        '''
+        fc = Linear(
+            in_features=input_size,
+            out_features=output_size,
+            bias=use_bias
+        )
+
+        self.layers.append(fc)
+
+        weights_initializer = initializers[weights_initializer]
+        weights_initializer(fc.weight)
+
+        bias_initializer = initializers[bias_initializer]
+        bias_initializer(fc.bias)
+
+        self.activity_regularizer = None
+
+        if weights_regularizer:
+            self.add_loss(lambda: reg_loss(fc.weight, weights_regularizer))
+        if bias_regularizer:
+            self.add_loss(lambda: reg_loss(fc.bias, bias_regularizer))
+        if activity_regularizer:
+            # Handle in forward call
+            self.activity_regularizer = activity_regularizer
+            self.add_loss(lambda: self.activation_loss)
+
 
         if norm and norm_params is None:
             norm_params = {}
         if norm == 'batch':
-            self.layers.append(BatchNormalization(**norm_params))
+            #self.layers.append(BatchNormalization(**norm_params))
+            # might need if statement for 1d vs 2d? like images
+            if len(input_size) > 3:
+                self.layers.append(BatchNorm1d(**norm_params))
+            else:
+                self.layers.append(BatchNorm2d(**norm_params))
         elif norm == 'layer':
-            self.layers.append(LayerNormalization(**norm_params))
+            self.layers.append(LayerNorm(**norm_params))
 
-        self.layers.append(Activation(activation))
+        # Dict for activation objects in pytorch?
+        #self.layers.append(Activations(activation))
+        self.layers.append(activations[activation]())
+        self.activation_index = len(self.layers) - 1
 
         if dropout > 0:
             self.layers.append(Dropout(dropout))
 
         for layer in self.layers:
+            # REMOVE, just temporary
+            layer.name = "Placeholder"
             logger.debug('   {}'.format(layer.name))
 
-    def call(self, inputs, training=None, mask=None):
+    def forward(self, inputs, training=None, mask=None):
+        self.training = training
+        batch_size = inputs.shape[0]
         hidden = inputs
 
-        for layer in self.layers:
-            hidden = layer(hidden, training=training)
+        for i, layer in enumerate(self.layers):
+            #hidden = layer(hidden, training=training)
+            hidden = layer(hidden)
+            if i == self.activation_index and self.activity_regularizer:
+                self.activation_loss = reg_loss(hidden, self.activity_regularizer)/batch_size
 
         return hidden
 
 
-class FCStack(Layer):
+class FCStack(LudwigModule):
 
     def __init__(
             self,
+            first_layer_input_size,
             layers=None,
             num_layers=1,
             default_fc_size=256,
             default_use_bias=True,
-            default_weights_initializer='glorot_uniform',
+            default_weights_initializer='xavier_uniform',
             default_bias_initializer='zeros',
             default_weights_regularizer=None,
             default_bias_regularizer=None,
@@ -98,9 +148,11 @@ class FCStack(Layer):
             default_norm_params=None,
             default_activation='relu',
             default_dropout=0,
+            residual=False,
             **kwargs
     ):
-        super(FCStack, self).__init__()
+        super().__init__()
+        self.input_size = first_layer_input_size
 
         if layers is None:
             self.layers = []
@@ -109,7 +161,11 @@ class FCStack(Layer):
         else:
             self.layers = layers
 
-        for layer in self.layers:
+        if len(self.layers) > 0:
+            self.layers[0]['input_size'] = first_layer_input_size
+        for i, layer in enumerate(self.layers):
+            if i != 0:
+                layer['input_size'] = self.layers[i-1]['fc_size']
             if 'fc_size' not in layer:
                 layer['fc_size'] = default_fc_size
             if 'use_bias' not in layer:
@@ -137,12 +193,14 @@ class FCStack(Layer):
             if 'dropout' not in layer:
                 layer['dropout'] = default_dropout
 
-        self.stack = []
+        #self.stack = []
+        self.stack = ModuleList()
 
         for i, layer in enumerate(self.layers):
             self.stack.append(
                 FCLayer(
-                    fc_size=layer['fc_size'],
+                    input_size=layer['input_size'],
+                    output_size=layer['fc_size'],
                     use_bias=layer['use_bias'],
                     weights_initializer=layer['weights_initializer'],
                     bias_initializer=layer['bias_initializer'],
@@ -157,15 +215,27 @@ class FCStack(Layer):
                     dropout=layer['dropout'],
                 )
             )
+        self.residual = residual
 
+    '''
     def build(
             self,
             input_shape,
     ):
-        super(FCStack, self).build(input_shape)
+        super().build(input_shape)
+        self.input_size = input_shape[-1]
+    '''
 
-    def call(self, inputs, training=None, mask=None):
+    def forward(self, inputs, training=None, mask=None):
         hidden = inputs
+        prev_fc_layer_size = self.input_size
         for layer in self.stack:
-            hidden = layer(hidden, training=training)
+            out = layer(hidden, training=training)
+            if self.residual and layer.fc_size == prev_fc_layer_size:
+                hidden = hidden + out
+            else:
+                hidden = out
+            # layers[0] is the dense layer in a FC layer
+            #prev_fc_layer_size = layer.layers[0].units
+            prev_fc_layer_size = layer.layers[0].out_features
         return hidden

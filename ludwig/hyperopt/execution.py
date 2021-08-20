@@ -11,7 +11,9 @@ from typing import Union
 from ludwig.api import LudwigModel
 from ludwig.callbacks import Callback
 from ludwig.constants import *
+from ludwig.hyperopt.results import TrialResults, HyperoptResults, RayTuneResults
 from ludwig.hyperopt.sampling import HyperoptSampler, RayTuneSampler, logger
+from ludwig.hyperopt.utils import load_json_values
 from ludwig.modules.metric_modules import get_best_function
 from ludwig.utils.data_utils import NumpyEncoder
 from ludwig.utils.defaults import default_random_seed
@@ -37,49 +39,82 @@ class HyperoptExecutor(ABC):
         self.metric = metric
         self.split = split
 
+    def _has_metric(self, stats, split):
+        if split is not None:
+            if split not in stats:
+                return False
+            stats = stats[split]
+
+        if self.output_feature not in stats:
+            return False
+        stats = stats[self.output_feature]
+
+        if self.metric not in stats:
+            return False
+        stats = stats[self.metric]
+        return len(stats) > 0
+
+    def _has_eval_metric(self, stats):
+        if stats is None:
+            return False
+
+        if self.output_feature not in stats:
+            return False
+        stats = stats[self.output_feature]
+
+        for metric_part in self.metric.split('.'):
+            if not isinstance(stats, dict) or metric_part not in stats:
+                return False
+            stats = stats[metric_part]
+        return isinstance(stats, float)
+
     def get_metric_score(self, train_stats, eval_stats) -> float:
         if (train_stats is not None and
-                self.split in train_stats and
-                VALIDATION in train_stats and  # needed otherwise can-t figure
-                # out the best epoch
-                self.output_feature in train_stats[self.split] and
-                self.metric in train_stats[self.split][self.output_feature]):
+                self._has_metric(train_stats, self.split) and
+                self._has_metric(train_stats, VALIDATION)):
             logger.info("Returning metric score from training statistics")
             return self.get_metric_score_from_train_stats(train_stats)
-        else:
+        elif self._has_eval_metric(eval_stats):
             logger.info("Returning metric score from eval statistics. "
                         "If skip_save_model is True, eval statistics "
                         "are calculated using the model at the last epoch "
                         "rather than the model at the epoch with "
                         "best validation performance")
             return self.get_metric_score_from_eval_stats(eval_stats)
+        elif self._has_metric(train_stats, TRAINING):
+            logger.info("Returning metric score from training split statistics, "
+                        "as no validation / eval sets were given")
+            return self.get_metric_score_from_train_stats(train_stats, TRAINING, TRAINING)
+        else:
+            raise RuntimeError("Unable to obtain metric score from missing training / eval statistics")
 
     def get_metric_score_from_eval_stats(self, eval_stats) -> Union[float, list]:
-        if '.' in self.metric:
-            metric_parts = self.metric.split('.')
-            stats = eval_stats[self.output_feature]
-            for metric_part in metric_parts:
-                if isinstance(stats, dict):
-                    if metric_part in stats:
-                        stats = stats[metric_part]
-                    else:
-                        raise ValueError(
-                            f"Evaluation statistics do not contain "
-                            f"the metric {self.metric}")
+        stats = eval_stats[self.output_feature]
+        for metric_part in self.metric.split('.'):
+            if isinstance(stats, dict):
+                if metric_part in stats:
+                    stats = stats[metric_part]
                 else:
-                    raise ValueError(f"Evaluation statistics do not contain "
-                                     f"the metric {self.metric}")
-            if not isinstance(stats, float):
-                raise ValueError(f"The metric {self.metric} in "
-                                 f"evaluation statistics is not "
-                                 f"a numerical value: {stats}")
-            return stats
-        return eval_stats[self.output_feature][self.metric]
+                    raise ValueError(
+                        f"Evaluation statistics do not contain "
+                        f"the metric {self.metric}")
+            else:
+                raise ValueError(f"Evaluation statistics do not contain "
+                                 f"the metric {self.metric}")
 
-    def get_metric_score_from_train_stats(self, train_stats) -> float:
+        if not isinstance(stats, float):
+            raise ValueError(f"The metric {self.metric} in "
+                             f"evaluation statistics is not "
+                             f"a numerical value: {stats}")
+        return stats
+
+    def get_metric_score_from_train_stats(self, train_stats, select_split=None, returned_split=None) -> float:
+        select_split = select_split or VALIDATION
+        returned_split = returned_split or self.split
+
         # grab the results of the model with highest validation test performance
-        train_valiset_stats = train_stats[VALIDATION]
-        train_evalset_stats = train_stats[self.split]
+        train_valiset_stats = train_stats[select_split]
+        train_evalset_stats = train_stats[returned_split]
 
         validation_field_result = train_valiset_stats[self.output_feature]
         best_function = get_best_function(self.metric)
@@ -97,7 +132,7 @@ class HyperoptExecutor(ABC):
 
     def sort_hyperopt_results(self, hyperopt_results):
         return sorted(
-            hyperopt_results, key=lambda hp_res: hp_res["metric_score"],
+            hyperopt_results, key=lambda hp_res: hp_res.metric_score,
             reverse=self.hyperopt_sampler.goal == MAXIMIZE
         )
 
@@ -128,11 +163,12 @@ class HyperoptExecutor(ABC):
             gpus=None,
             gpu_memory_limit=None,
             allow_parallel_threads=True,
+            callbacks=None,
             backend=None,
             random_seed=default_random_seed,
             debug=False,
             **kwargs
-    ):
+    ) -> HyperoptResults:
         pass
 
 
@@ -171,12 +207,13 @@ class SerialExecutor(HyperoptExecutor):
             gpus=None,
             gpu_memory_limit=None,
             allow_parallel_threads=True,
+            callbacks=None,
             backend=None,
             random_seed=default_random_seed,
             debug=False,
             **kwargs
-    ):
-        hyperopt_results = []
+    ) -> HyperoptResults:
+        trial_results = []
         trials = 0
         while not self.hyperopt_sampler.finished():
             sampled_parameters = self.hyperopt_sampler.sample_batch()
@@ -194,6 +231,7 @@ class SerialExecutor(HyperoptExecutor):
                     gpus=gpus,
                     gpu_memory_limit=gpu_memory_limit,
                     allow_parallel_threads=allow_parallel_threads,
+                    callbacks=callbacks,
                 )
                 eval_stats, train_stats, _, _ = model.experiment(
                     dataset=dataset,
@@ -225,22 +263,19 @@ class SerialExecutor(HyperoptExecutor):
                 metric_score = self.get_metric_score(train_stats, eval_stats)
                 metric_scores.append(metric_score)
 
-                hyperopt_results.append(
-                    {
-                        "parameters": parameters,
-                        "metric_score": metric_score,
-                        "training_stats": train_stats,
-                        "eval_stats": eval_stats,
-                    }
-                )
+                trial_results.append(TrialResults(
+                    parameters=parameters,
+                    metric_score=metric_score,
+                    training_stats=train_stats,
+                    eval_stats=eval_stats,
+                ))
             trials += len(sampled_parameters)
 
             self.hyperopt_sampler.update_batch(
                 zip(sampled_parameters, metric_scores))
 
-        hyperopt_results = self.sort_hyperopt_results(hyperopt_results)
-
-        return hyperopt_results
+        ordered_trials = self.sort_hyperopt_results(trial_results)
+        return HyperoptResults(ordered_trials=ordered_trials)
 
 
 class ParallelExecutor(HyperoptExecutor):
@@ -269,19 +304,19 @@ class ParallelExecutor(HyperoptExecutor):
     def init_worker():
         signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    def _run_experiment(self, hyperopt_dict):
+    def _run_experiment(self, hyperopt_dict: dict) -> TrialResults:
         parameters = hyperopt_dict["parameters"]
         train_stats, eval_stats = run_experiment(**hyperopt_dict)
         metric_score = self.get_metric_score(train_stats, eval_stats)
 
-        return {
-            "parameters": parameters,
-            "metric_score": metric_score,
-            "training_stats": train_stats,
-            "eval_stats": eval_stats,
-        }
+        return TrialResults(
+            parameters=parameters,
+            metric_score=metric_score,
+            training_stats=train_stats,
+            eval_stats=eval_stats,
+        )
 
-    def _run_experiment_gpu(self, hyperopt_dict):
+    def _run_experiment_gpu(self, hyperopt_dict: dict) -> TrialResults:
         gpu_id_meta = self.queue.get()
         try:
             parameters = hyperopt_dict['parameters']
@@ -291,12 +326,12 @@ class ParallelExecutor(HyperoptExecutor):
             metric_score = self.get_metric_score(train_stats, eval_stats)
         finally:
             self.queue.put(gpu_id_meta)
-        return {
-            "parameters": parameters,
-            "metric_score": metric_score,
-            "training_stats": train_stats,
-            "eval_stats": eval_stats,
-        }
+        return TrialResults(
+            parameters=parameters,
+            metric_score=metric_score,
+            training_stats=train_stats,
+            eval_stats=eval_stats,
+        )
 
     def execute(
             self,
@@ -324,11 +359,12 @@ class ParallelExecutor(HyperoptExecutor):
             gpus=None,
             gpu_memory_limit=None,
             allow_parallel_threads=True,
+            callbacks=None,
             backend=None,
             random_seed=default_random_seed,
             debug=False,
             **kwargs
-    ):
+    ) -> HyperoptResults:
         ctx = multiprocessing.get_context('spawn')
 
         if gpus is None:
@@ -445,7 +481,7 @@ class ParallelExecutor(HyperoptExecutor):
         pool = ctx.Pool(self.num_workers,
                         ParallelExecutor.init_worker)
         try:
-            hyperopt_results = []
+            trial_results = []
             trials = 0
             while not self.hyperopt_sampler.finished():
                 sampled_parameters = self.hyperopt_sampler.sample_batch()
@@ -485,6 +521,7 @@ class ParallelExecutor(HyperoptExecutor):
                             gpus=gpus,
                             gpu_memory_limit=gpu_memory_limit,
                             allow_parallel_threads=allow_parallel_threads,
+                            callbacks=callbacks,
                             backend=backend,
                             random_seed=random_seed,
                             debug=debug,
@@ -500,18 +537,17 @@ class ParallelExecutor(HyperoptExecutor):
                                              hyperopt_parameters)
 
                 self.hyperopt_sampler.update_batch(
-                    (result["parameters"], result["metric_score"]) for result
-                    in
-                    batch_results
+                    (result.parameters, result.metric_score)
+                    for result in batch_results
                 )
 
-                hyperopt_results.extend(batch_results)
+                trial_results.extend(batch_results)
         finally:
             pool.close()
             pool.join()
 
-        hyperopt_results = self.sort_hyperopt_results(hyperopt_results)
-        return hyperopt_results
+        ordered_trials = self.sort_hyperopt_results(trial_results)
+        return HyperoptResults(ordered_trials=ordered_trials)
 
 
 class FiberExecutor(HyperoptExecutor):
@@ -577,11 +613,12 @@ class FiberExecutor(HyperoptExecutor):
             gpus=None,
             gpu_memory_limit=None,
             allow_parallel_threads=True,
+            callbacks=None,
             backend=None,
             random_seed=default_random_seed,
             debug=False,
             **kwargs
-    ):
+    ) -> HyperoptResults:
         experiment_kwargs = dict(
             dataset=dataset,
             training_set=training_set,
@@ -606,6 +643,7 @@ class FiberExecutor(HyperoptExecutor):
             gpus=gpus,
             gpu_memory_limit=gpu_memory_limit,
             allow_parallel_threads=allow_parallel_threads,
+            callbacks=callbacks,
             backend=backend,
             random_seed=random_seed,
             debug=debug,
@@ -616,7 +654,7 @@ class FiberExecutor(HyperoptExecutor):
             experiemnt_fn = self.fiber_meta(**self.resource_limits)(
                 experiemnt_fn)
 
-        hyperopt_results = []
+        trial_results = []
         trials = 0
         while not self.hyperopt_sampler.finished():
             sampled_parameters = self.hyperopt_sampler.sample_batch()
@@ -628,6 +666,7 @@ class FiberExecutor(HyperoptExecutor):
                     {
                         'config': substitute_parameters(
                             copy.deepcopy(config), parameters),
+                        'parameters': parameters,
                         'experiment_name': f'{experiment_name}_{trials + i}',
                         **experiment_kwargs
                     }
@@ -641,21 +680,18 @@ class FiberExecutor(HyperoptExecutor):
                 metric_score = self.get_metric_score(train_stats, eval_stats)
                 metric_scores.append(metric_score)
 
-                hyperopt_results.append(
-                    {
-                        "parameters": parameters,
-                        "metric_score": metric_score,
-                        "training_stats": train_stats,
-                        "eval_stats": eval_stats,
-                    }
-                )
+                trial_results.append(TrialResults(
+                    parameters=parameters,
+                    metric_score=metric_score,
+                    training_stats=train_stats,
+                    eval_stats=eval_stats,
+                ))
 
             self.hyperopt_sampler.update_batch(
                 zip(sampled_parameters, metric_scores))
 
-        hyperopt_results = self.sort_hyperopt_results(hyperopt_results)
-
-        return hyperopt_results
+        ordered_trials = self.sort_hyperopt_results(trial_results)
+        return HyperoptResults(ordered_trials=ordered_trials)
 
 
 class RayTuneExecutor(HyperoptExecutor):
@@ -720,35 +756,41 @@ class RayTuneExecutor(HyperoptExecutor):
 
         class RayTuneReportCallback(Callback):
             def on_epoch_end(self, trainer, progress_tracker, save_path):
-                if trainer.is_coordinator():
-                    with tune.checkpoint_dir(step=progress_tracker.epoch) as checkpoint_dir:
-                        checkpoint_model = os.path.join(checkpoint_dir, 'model')
-                        # shutil.copytree(save_path, checkpoint_model)
-                        # Note: A previous implementation used shutil.copytree() 
-                        # however, this copying method is non atomic
-                        if not os.path.isdir(checkpoint_model):
-                            copy_id = uuid.uuid4()
-                            tmp_dst = "%s.%s.tmp" % (checkpoint_model, copy_id)
-                            shutil.copytree(save_path, tmp_dst)
-                            try:
-                                os.rename(tmp_dst, checkpoint_model)
-                            except:
-                                shutil.rmtree(tmp_dst)
+                with tune.checkpoint_dir(step=progress_tracker.epoch) as checkpoint_dir:
+                    checkpoint_model = os.path.join(checkpoint_dir, 'model')
+                    # shutil.copytree(save_path, checkpoint_model)
+                    # Note: A previous implementation used shutil.copytree()
+                    # however, this copying method is non atomic
+                    if not os.path.isdir(checkpoint_model):
+                        copy_id = uuid.uuid4()
+                        tmp_dst = "%s.%s.tmp" % (checkpoint_model, copy_id)
+                        shutil.copytree(save_path, tmp_dst)
+                        try:
+                            os.rename(tmp_dst, checkpoint_model)
+                        except:
+                            shutil.rmtree(tmp_dst)
 
-                    train_stats, eval_stats = progress_tracker.train_metrics, progress_tracker.vali_metrics
-                    stats = eval_stats or train_stats
-                    metric_score = tune_executor.get_metric_score_from_eval_stats(stats)[-1]
-                    tune.report(
-                        parameters=json.dumps(config, cls=NumpyEncoder),
-                        metric_score=metric_score,
-                        training_stats=json.dumps(train_stats, cls=NumpyEncoder),
-                        eval_stats=json.dumps(eval_stats, cls=NumpyEncoder)
-                    )
+                train_stats = {
+                    TRAINING: progress_tracker.train_metrics,
+                    VALIDATION: progress_tracker.vali_metrics,
+                    TEST: progress_tracker.test_metrics,
+                }
+
+                metric_score = tune_executor.get_metric_score(train_stats, eval_stats=None)
+                tune.report(
+                    parameters=json.dumps(config, cls=NumpyEncoder),
+                    metric_score=metric_score,
+                    training_stats=json.dumps(train_stats[TRAINING], cls=NumpyEncoder),
+                    eval_stats=json.dumps(train_stats[VALIDATION], cls=NumpyEncoder)
+                )
+
+        callbacks = hyperopt_dict.get('callbacks') or []
+        hyperopt_dict['callbacks'] = callbacks + [RayTuneReportCallback()]
 
         train_stats, eval_stats = run_experiment(
             **hyperopt_dict,
             model_resume_path=checkpoint_dir,
-            callbacks=[RayTuneReportCallback()],
+            parameters=config,
         )
 
         metric_score = self.get_metric_score(train_stats, eval_stats)
@@ -759,35 +801,38 @@ class RayTuneExecutor(HyperoptExecutor):
             eval_stats=json.dumps(eval_stats, cls=NumpyEncoder)
         )
 
-    def execute(self,
-                config,
-                dataset=None,
-                training_set=None,
-                validation_set=None,
-                test_set=None,
-                training_set_metadata=None,
-                data_format=None,
-                experiment_name="hyperopt",
-                model_name="run",
-                # model_load_path=None,
-                # model_resume_path=None,
-                skip_save_training_description=False,
-                skip_save_training_statistics=False,
-                skip_save_model=False,
-                skip_save_progress=False,
-                skip_save_log=False,
-                skip_save_processed_input=True,
-                skip_save_unprocessed_output=False,
-                skip_save_predictions=False,
-                skip_save_eval_stats=False,
-                output_directory="results",
-                gpus=None,
-                gpu_memory_limit=None,
-                allow_parallel_threads=True,
-                backend=None,
-                random_seed=default_random_seed,
-                debug=False,
-                **kwargs):
+    def execute(
+            self,
+            config,
+            dataset=None,
+            training_set=None,
+            validation_set=None,
+            test_set=None,
+            training_set_metadata=None,
+            data_format=None,
+            experiment_name="hyperopt",
+            model_name="run",
+            # model_load_path=None,
+            # model_resume_path=None,
+            skip_save_training_description=False,
+            skip_save_training_statistics=False,
+            skip_save_model=False,
+            skip_save_progress=False,
+            skip_save_log=False,
+            skip_save_processed_input=True,
+            skip_save_unprocessed_output=False,
+            skip_save_predictions=False,
+            skip_save_eval_stats=False,
+            output_directory="results",
+            gpus=None,
+            gpu_memory_limit=None,
+            allow_parallel_threads=True,
+            callbacks=None,
+            backend=None,
+            random_seed=default_random_seed,
+            debug=False,
+            **kwargs
+    ) -> RayTuneResults:
         if isinstance(dataset, str) and not os.path.isabs(dataset):
             dataset = os.path.abspath(dataset)
 
@@ -822,6 +867,7 @@ class RayTuneExecutor(HyperoptExecutor):
             gpus=gpus,
             gpu_memory_limit=gpu_memory_limit,
             allow_parallel_threads=allow_parallel_threads,
+            callbacks=callbacks,
             backend=backend,
             random_seed=random_seed,
             debug=debug,
@@ -858,6 +904,15 @@ class RayTuneExecutor(HyperoptExecutor):
         def run_experiment_trial(config, checkpoint_dir=None):
             return self._run_experiment(config, checkpoint_dir, hyperopt_dict, self.decode_ctx)
 
+        tune_config = {}
+        tune_callbacks = []
+        for callback in callbacks or []:
+            run_experiment_trial, tune_config = callback.prepare_ray_tune(
+                run_experiment_trial,
+                tune_config,
+                tune_callbacks,
+            )
+
         register_trainable(
             f"trainable_func_f{hash_dict(config)}", 
             run_experiment_trial
@@ -865,7 +920,10 @@ class RayTuneExecutor(HyperoptExecutor):
 
         analysis = tune.run(
             f"trainable_func_f{hash_dict(config)}",
-            config=self.search_space,
+            config={
+                **self.search_space,
+                **tune_config,
+            },
             scheduler=self.scheduler,
             search_alg=search_alg,
             num_samples=self.num_samples,
@@ -877,14 +935,24 @@ class RayTuneExecutor(HyperoptExecutor):
             mode=mode,
             trial_name_creator=lambda trial: f"trial_{trial.trial_id}",
             trial_dirname_creator=lambda trial: f"trial_{trial.trial_id}",
+            callbacks=tune_callbacks,
         )
 
-        hyperopt_results = analysis.results_df.sort_values(
+        ordered_trials = analysis.results_df.sort_values(
             "metric_score",
             ascending=self.goal != MAXIMIZE
         )
 
-        return hyperopt_results.to_dict(orient="records")
+        ordered_trials = [
+            TrialResults.from_dict(
+                load_json_values(kwargs)
+            ) for kwargs in ordered_trials.to_dict(orient="records")
+        ]
+
+        return RayTuneResults(
+            ordered_trials=ordered_trials,
+            experiment_analysis=analysis
+        )
 
 
 def get_build_hyperopt_executor(executor_type):
@@ -940,6 +1008,7 @@ def substitute_parameters(config, parameters):
 
 def run_experiment(
         config,
+        parameters=None,
         dataset=None,
         training_set=None,
         validation_set=None,
@@ -964,12 +1033,15 @@ def run_experiment(
         gpus=None,
         gpu_memory_limit=None,
         allow_parallel_threads=True,
-        backend=None,
         callbacks=None,
+        backend=None,
         random_seed=default_random_seed,
         debug=False,
         **kwargs
 ):
+    for callback in callbacks or []:
+        callback.on_hyperopt_trial_start(parameters)
+
     # Collect training and validation losses and metrics
     # & append it to `results`
     model = LudwigModel(
@@ -978,6 +1050,7 @@ def run_experiment(
         gpus=gpus,
         gpu_memory_limit=gpu_memory_limit,
         allow_parallel_threads=allow_parallel_threads,
+        callbacks=callbacks,
     )
     eval_stats, train_stats, _, _ = model.experiment(
         dataset=dataset,
@@ -1003,7 +1076,6 @@ def run_experiment(
         output_directory=output_directory,
         skip_collect_predictions=True,
         skip_collect_overall_stats=False,
-        callbacks=callbacks,
         random_seed=random_seed,
         debug=debug,
     )

@@ -32,6 +32,7 @@ import numpy
 import ludwig.globals
 from ludwig.constants import PROC_COLUMN
 from ludwig.utils.data_utils import figure_data_format
+from ludwig.utils.fs_utils import find_non_existing_dir_by_adding_suffix
 
 
 def get_experiment_description(
@@ -170,15 +171,6 @@ def set_default_values(dictionary, default_value_dictionary):
         set_default_value(dictionary, key, value)
 
 
-def find_non_existing_dir_by_adding_suffix(directory_name):
-    curr_directory_name = directory_name
-    suffix = 0
-    while os.path.exists(curr_directory_name):
-        curr_directory_name = directory_name + '_' + str(suffix)
-        suffix += 1
-    return curr_directory_name
-
-
 def get_class_attributes(c):
     return set(
         i for i in dir(c)
@@ -221,23 +213,6 @@ def get_file_names(output_directory):
     model_dir = os.path.join(output_directory, 'model')
 
     return description_fn, training_stats_fn, model_dir
-
-
-def check_which_config(config, config_file):
-    # check for config and config_file
-    if config is None and config_file is None:
-        raise ValueError(
-            'Either config of config_file have to be'
-            'not None to initialize a LudwigModel'
-        )
-    if config is not None and config_file is not None:
-        raise ValueError(
-            'Only one between config and '
-            'config_file can be provided'
-        )
-    if not config:
-        config = config_file
-    return config
 
 
 def hash_dict(d: dict, max_length: Union[int, None] = 6) -> bytes:

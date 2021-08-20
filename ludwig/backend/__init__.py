@@ -18,6 +18,11 @@
 from ludwig.backend.base import Backend, LocalBackend
 from ludwig.utils.horovod_utils import has_horovodrun
 
+try:
+    import ray as _ray
+except:
+    _ray = None
+
 
 LOCAL_BACKEND = LocalBackend()
 
@@ -29,23 +34,34 @@ RAY = 'ray'
 ALL_BACKENDS = [LOCAL, DASK, HOROVOD, RAY]
 
 
-def get_local_backend():
-    return LOCAL_BACKEND
+def _has_ray():
+    if _ray is None:
+        return False
+
+    try:
+        _ray.init('auto', ignore_reinit_error=True)
+        return True
+    except:
+        return False
 
 
-def create_dask_backend():
+def get_local_backend(**kwargs):
+    return LocalBackend(**kwargs)
+
+
+def create_dask_backend(**kwargs):
     from ludwig.backend.dask import DaskBackend
-    return DaskBackend()
+    return DaskBackend(**kwargs)
 
 
-def create_horovod_backend():
+def create_horovod_backend(**kwargs):
     from ludwig.backend.horovod import HorovodBackend
-    return HorovodBackend()
+    return HorovodBackend(**kwargs)
 
 
-def create_ray_backend():
+def create_ray_backend(**kwargs):
     from ludwig.backend.ray import RayBackend
-    return RayBackend()
+    return RayBackend(**kwargs)
 
 
 backend_registry = {
@@ -57,17 +73,22 @@ backend_registry = {
 }
 
 
-def create_backend(backend):
-    if isinstance(backend, Backend):
-        return backend
+def create_backend(type, **kwargs):
+    if isinstance(type, Backend):
+        return type
 
-    if backend is None and has_horovodrun():
-        backend = HOROVOD
+    if type is None and _has_ray():
+        type = RAY
+    elif type is None and has_horovodrun():
+        type = HOROVOD
 
-    return backend_registry[backend]()
+    return backend_registry[type](**kwargs)
 
 
 def initialize_backend(backend):
-    backend = create_backend(backend)
+    if isinstance(backend, dict):
+        backend = create_backend(**backend)
+    else:
+        backend = create_backend(backend)
     backend.initialize()
     return backend

@@ -19,17 +19,23 @@ from typing import Dict
 
 import tensorflow as tf
 
+import torch
+from torch.nn import Module
+
 from ludwig.constants import *
 from ludwig.features.feature_utils import compute_feature_hash
 from ludwig.modules.fully_connected_modules import FCStack
 from ludwig.modules.reduction_modules import SequenceReducer
 from ludwig.utils.misc_utils import merge_dict, get_from_registry
-from ludwig.utils.tf_utils import sequence_length_3D
+#from ludwig.utils.tf_utils import sequence_length_3D
+from ludwig.utils.torch_utils import sequence_length_3D, sequence_mask, LudwigModule
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
 
-class BaseFeature(object):
+class BaseFeature:
     """Base class for all features.
 
     Note that this class is not-cooperative (does not forward kwargs), so when constructing
@@ -69,7 +75,7 @@ class BaseFeature(object):
                     setattr(self, k, feature[k])
 
 
-class InputFeature(BaseFeature, tf.keras.Model, ABC):
+class InputFeature(BaseFeature, LudwigModule, ABC):
     """Parent class for all input features."""
 
     def __init__(self, *args, **kwargs):
@@ -89,6 +95,11 @@ class InputFeature(BaseFeature, tf.keras.Model, ABC):
     @abstractmethod
     def get_input_shape(self):
         """Returns a tuple representing the Tensor shape this input accepts."""
+        pass
+
+    @abstractmethod
+    def get_output_shape(self):
+        """Returns a tuple representing the Tensor shape this input outputs."""
         pass
 
     @staticmethod
@@ -117,11 +128,11 @@ class InputFeature(BaseFeature, tf.keras.Model, ABC):
         )
 
 
-class OutputFeature(BaseFeature, tf.keras.Model, ABC):
+class OutputFeature(BaseFeature, LudwigModule, ABC):
     """Parent class for all output features."""
 
-    train_loss_function = None
-    eval_loss_function = None
+    #train_loss_function = None
+    #eval_loss_function = None
 
     def __init__(self, feature, *args, **kwargs):
         super().__init__(*args, feature=feature, **kwargs)
@@ -145,12 +156,14 @@ class OutputFeature(BaseFeature, tf.keras.Model, ABC):
         self.norm_params = None
         self.activation = 'relu'
         self.dropout = 0
+        self.input_size = None
 
         self.overwrite_defaults(feature)
 
         logger.debug(' output feature fully connected layers')
         logger.debug('  FCStack')
         self.fc_stack = FCStack(
+            first_layer_input_size=self.input_size,
             layers=self.fc_layers,
             num_layers=self.num_fc_layers,
             default_fc_size=self.fc_size,
@@ -184,6 +197,11 @@ class OutputFeature(BaseFeature, tf.keras.Model, ABC):
                               dtype=self.get_output_dtype(),
                               name=self.name + '_input')
 
+    @abstractmethod
+    def get_prediction_set(self):
+        """Returns the set of prediction columns returned by this feature."""
+        pass
+
     @classmethod
     @abstractmethod
     def get_output_dtype(cls):
@@ -193,6 +211,11 @@ class OutputFeature(BaseFeature, tf.keras.Model, ABC):
     @abstractmethod
     def get_output_shape(self):
         """Returns a tuple representing the Tensor shape this feature outputs."""
+        pass
+
+    @abstractmethod
+    def get_input_shape(self):
+        """Returns a tuple representing the Tensor shape this feature accepts."""
         pass
 
     @property
@@ -211,30 +234,36 @@ class OutputFeature(BaseFeature, tf.keras.Model, ABC):
         )
 
     def train_loss(self, targets, predictions):
-        return self.train_loss_function(targets, predictions)
+        #return self.train_loss_function(targets, predictions)
+        return self.train_loss_function(predictions, targets)
 
     def eval_loss(self, targets, predictions):
-        return self.eval_loss_function(targets, predictions)
+        #return self.eval_loss_function(targets, predictions)
+        return self.eval_loss_function(predictions, targets)
 
     def update_metrics(self, targets, predictions):
         for metric, metric_fn in self.metric_functions.items():
             if metric == LOSS or metric == HITS_AT_K:
-                metric_fn.update_state(targets, predictions)
+                #metric_fn.update_state(targets, predictions)
+                metric_fn.update(predictions, targets)
             else:
-                metric_fn.update_state(targets, predictions[PREDICTIONS])
+                #metric_fn.update_state(targets, predictions[PREDICTIONS])
+                metric_fn.update(predictions[PREDICTIONS], targets)
 
     def get_metrics(self):
         metric_vals = {}
         for metric_name, metric_onj in self.metric_functions.items():
-            metric_vals[metric_name] = metric_onj.result().numpy()
+            #metric_vals[metric_name] = metric_onj.result().numpy()
+            metric_vals[metric_name] = metric_onj.compute().detach().numpy().item()
         return metric_vals
 
     def reset_metrics(self):
         for of_name, metric_fn in self.metric_functions.items():
             if metric_fn is not None:
-                metric_fn.reset_states()
+                #metric_fn.reset_states()
+                metric_fn.reset()
 
-    def call(
+    def forward(
             self,
             inputs,
             # ((hidden, other_output_hidden), target) or (hidden, other_output_hidden)
@@ -269,18 +298,24 @@ class OutputFeature(BaseFeature, tf.keras.Model, ABC):
                 combiner_outputs['encoder_output_state']
         if LENGTHS in combiner_outputs:
             logits_input[LENGTHS] = combiner_outputs[LENGTHS]
-        logits = self.logits(logits_input, target=target, training=training)
+        logits = self.logits(logits_input, target=target,
+                             training=training)
 
-        # most of the cases the output of self.logits is a tensor
-        # in some cases like for sequence features, it can be  tuple of
-        # logits, predictions, scores
-        # The first element will be the logits tensor
-        if isinstance(logits, tuple):
-            logits = logits[0]
-        if not isinstance(logits, dict):
+        # most of the cases the output of self.logits() is a tensor
+        # there are three special cases:
+        # categorical feature: logits is a dictionary
+        #   with keys: logits, projection_input
+        # sequence feature with Generator Decoder: 'logits' is a dictionary
+        #   with keys: logits, projection_input
+        # sequence feature with Tagger Decoder: 'logits' is a dictionary
+        #   with keys: logits, lengths, projection_input
+        #
+
+        if isinstance(logits, torch.Tensor):
             logits = {'logits': logits}
 
         return {
+            # last_hidden used for dependencies processing
             'last_hidden': hidden,
             **logits
         }
@@ -303,7 +338,7 @@ class OutputFeature(BaseFeature, tf.keras.Model, ABC):
             result,
             metadata,
             output_directory,
-            skip_save_unprocessed_output=False,
+            backend,
     ):
         pass
 
@@ -348,17 +383,31 @@ class OutputFeature(BaseFeature, tf.keras.Model, ABC):
                     else:
                         # matrix vector -> tile concat
                         sequence_max_length = hidden.shape[1]
+                        '''
                         multipliers = tf.concat(
                             [[1], [sequence_max_length], [1]],
                             0
                         )
+                        '''
+                        multipliers = torch.cat(
+                            [[1], [sequence_max_length], [1]],
+                            dim=0
+                        )
+
+                        '''
                         tiled_representation = tf.tile(
                             tf.expand_dims(dependency_final_hidden, 1),
+                            multipliers
+                        )
+                        '''
+                        tiled_representation = torch.tile(
+                            torch.unsqueeze(dependency_final_hidden, 1),
                             multipliers
                         )
 
                         # todo future: maybe modify this with TF2 mask mechanics
                         sequence_length = sequence_length_3D(hidden)
+                        '''
                         mask = tf.sequence_mask(
                             sequence_length,
                             sequence_max_length
@@ -366,6 +415,15 @@ class OutputFeature(BaseFeature, tf.keras.Model, ABC):
                         tiled_representation = tf.multiply(
                             tiled_representation,
                             tf.cast(mask[:, :, tf.newaxis], dtype=tf.float32)
+                        )
+                        '''
+                        mask = sequence_mask(
+                            sequence_length,
+                            sequence_max_length
+                        )
+                        tiled_representation = torch.mul(
+                            tiled_representation,
+                            mask[:, :, np.newaxis].type(torch.float32)
                         )
 
                         dependencies_hidden.append(tiled_representation)
@@ -416,9 +474,15 @@ class OutputFeature(BaseFeature, tf.keras.Model, ABC):
 
         # flatten inputs
         if len(original_feature_hidden.shape) > 2:
+            '''
             feature_hidden = tf.reshape(
                 feature_hidden,
                 [-1, feature_hidden.shape[-1]]
+            )
+            '''
+            feature_hidden = torch.reshape(
+                feature_hidden,
+                (-1, list(feature_hidden.shape)[-1])
             )
 
         # pass it through fc_stack
@@ -432,9 +496,15 @@ class OutputFeature(BaseFeature, tf.keras.Model, ABC):
         # reshape back to original first and second dimension
         if len(original_feature_hidden.shape) > 2:
             sequence_length = original_feature_hidden.shape[1]
+            '''
             feature_hidden = tf.reshape(
                 feature_hidden,
                 [-1, sequence_length, feature_hidden_size]
+            )
+            '''
+            feature_hidden = torch.reshape(
+                feature_hidden,
+                (-1, sequence_length, feature_hidden_size)
             )
 
         return feature_hidden

@@ -32,7 +32,7 @@ H3_VECTOR_LENGTH = MAX_H3_RESOLUTION + 4
 H3_PADDING_VALUE = 7
 
 
-class H3FeatureMixin(object):
+class H3FeatureMixin:
     type = H3
     preprocessing_defaults = {
         'missing_value_strategy': FILL_WITH_CONST,
@@ -40,10 +40,16 @@ class H3FeatureMixin(object):
         # mode 1 edge 0 resolution 0 base_cell 0
     }
 
+    preprocessing_schema = {
+        'missing_value_strategy': {'type': 'string', 'enum': MISSING_VALUE_STRATEGY_OPTIONS},
+        'fill_value': {'type': 'integer'},
+        'computed_fill_value': {'type': 'integer'},
+    }
+
     @staticmethod
-    def cast_column(feature, dataset_df, backend):
+    def cast_column(column, backend):
         # todo: add cast to int64
-        return dataset_df
+        return column
 
     @staticmethod
     def get_feature_meta(column, preprocessing_parameters, backend):
@@ -70,7 +76,8 @@ class H3FeatureMixin(object):
             proc_df,
             metadata,
             preprocessing_parameters,
-            backend
+            backend,
+            skip_save_processed_input
     ):
         column = input_df[feature[COLUMN]]
         if column.dtype == object:
@@ -97,7 +104,7 @@ class H3InputFeature(H3FeatureMixin, InputFeature):
 
     def call(self, inputs, training=None, mask=None):
         assert isinstance(inputs, tf.Tensor)
-        assert inputs.dtype == tf.uint8
+        assert inputs.dtype in [tf.uint8, tf.int64]
         assert len(inputs.shape) == 2
 
         inputs_encoded = self.encoder_obj(

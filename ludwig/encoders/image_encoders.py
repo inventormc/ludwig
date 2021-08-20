@@ -21,10 +21,11 @@ import tensorflow as tf
 from tensorflow.keras.layers import Flatten
 
 from ludwig.encoders.base import Encoder
+from ludwig.modules.mlp_mixer_modules import MLPMixer
 from ludwig.utils.registry import Registry, register, register_default
 from ludwig.modules.convolutional_modules import Conv2DStack, \
     get_resnet_block_sizes
-from ludwig.modules.convolutional_modules import ResNet2
+from ludwig.modules.convolutional_modules import ResNet
 from ludwig.modules.fully_connected_modules import FCStack
 
 logger = logging.getLogger(__name__)
@@ -83,7 +84,7 @@ class Stacked2DCNN(ImageEncoder):
             fc_dropout=0,
             **kwargs
     ):
-        super(Stacked2DCNN, self).__init__()
+        super().__init__()
 
         logger.debug(' {}'.format(self.name))
 
@@ -113,7 +114,9 @@ class Stacked2DCNN(ImageEncoder):
             default_pool_strides=pool_strides,
         )
 
-        logger.debug('  FCStacl')
+        self.flatten = Flatten()
+
+        logger.debug('  FCStack')
         self.fc_stack = FCStack(
             layers=fc_layers,
             num_layers=num_fc_layers,
@@ -143,7 +146,7 @@ class Stacked2DCNN(ImageEncoder):
             inputs,
             training,
         )
-        hidden = tf.reshape(hidden, [hidden.shape[0], -1])
+        hidden = self.flatten(hidden, training=training)
 
         # ================ Fully Connected ================
         outputs = self.fc_stack(hidden)
@@ -181,7 +184,7 @@ class ResNetEncoder(ImageEncoder):
             dropout=0,
             **kwargs
     ):
-        super(ResNetEncoder, self).__init__()
+        super().__init__()
         logger.debug(' {}'.format(self.name))
 
         if resnet_size < 50:
@@ -192,8 +195,8 @@ class ResNetEncoder(ImageEncoder):
         block_sizes = get_resnet_block_sizes(resnet_size)
         block_strides = [1, 2, 2, 2][:len(block_sizes)]
 
-        logger.debug('  ResNet2')
-        self.resnet = ResNet2(
+        logger.debug('  ResNet')
+        self.resnet = ResNet(
             resnet_size,
             bottleneck,
             num_filters,
@@ -234,4 +237,47 @@ class ResNetEncoder(ImageEncoder):
         hidden = self.flatten(hidden, training=training)
         hidden = self.fc_stack(hidden, training=training)
 
+        return {'encoder_output': hidden}
+
+
+@register(name='mlp_mixer')
+class MLPMixerEncoder(ImageEncoder):
+
+    def __init__(
+            self,
+            patch_size=16,
+            embed_size=512,
+            token_size=2048,
+            channel_dim=256,
+            num_layers=8,
+            dropout=0.0,
+            avg_pool=True,
+            # weights_initializer='glorot_uniform',
+            # bias_initializer='zeros',
+            # weights_regularizer=None,
+            # bias_regularizer=None,
+            # activity_regularizer=None,
+            # weights_constraint=None,
+            # bias_constraint=None,
+            # norm=None,
+            # norm_params=None,
+            # activation='gelu',
+            **kwargs
+    ):
+        super().__init__()
+        logger.debug(' {}'.format(self.name))
+
+        logger.debug('  MLPMixer')
+        self.mlp_mixer = MLPMixer(
+            patch_size=patch_size,
+            embed_size=embed_size,
+            token_size=token_size,
+            channel_dim=channel_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            avg_pool=avg_pool,
+        )
+
+    def call(self, inputs, training=None, mask=None):
+        hidden = self.mlp_mixer(inputs, training=training)
         return {'encoder_output': hidden}

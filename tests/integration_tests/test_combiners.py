@@ -7,8 +7,9 @@ from ludwig.combiners.combiners import (
     ConcatCombiner,
     SequenceConcatCombiner,
     SequenceCombiner,
+    TabNetCombiner,
     ComparatorCombiner,
-    sequence_encoder_registry,
+    sequence_encoder_registry, TransformerCombiner,
 )
 
 logger = logging.getLogger(__name__)
@@ -218,6 +219,45 @@ def test_sequence_combiner(
         combiner_shape[-1] == default_fc_size
 
 
+def test_tabnet_combiner(encoder_outputs):
+    # clean out unneeded encoder outputs
+    encoder_outputs = {}
+    encoder_outputs['feature_1'] = {
+        'encoder_output': tf.random.normal(
+            [128, 1],
+            dtype=tf.float32
+        )
+    }
+    encoder_outputs['feature_2'] = {
+        'encoder_output': tf.random.normal(
+            [128, 1],
+            dtype=tf.float32
+        )
+    }
+
+    input_features_def = [
+        {'name': 'feature_1', 'type': 'numerical'},
+        {'name': 'feature_2', 'type': 'numerical'}
+    ]
+
+    # setup combiner to test
+    combiner = TabNetCombiner(
+        size=2,
+        output_size=2,
+        num_steps=3,
+        num_total_blocks=4,
+        num_shared_blocks=2,
+        dropout=0.1
+    )
+
+    # concatenate encoder outputs
+    results = combiner(encoder_outputs)
+
+    # required key present
+    assert 'combiner_output' in results
+    assert 'attention_masks' in results
+
+
 @pytest.mark.parametrize("fc_layer",
                          [None, [{"fc_size": 64}, {"fc_size": 64}]])
 @pytest.mark.parametrize("entity_1", [["text_feature_1", "text_feature_2"]])
@@ -249,3 +289,36 @@ def test_comparator_combiner(encoder_comparator_outputs, fc_layer, entity_1,
     # this assumes dimensionality = 2
     size = BATCH_SIZE * 2 + fc_size * 2
     assert results["combiner_output"].shape.as_list() == [BATCH_SIZE, size]
+
+
+def test_transformer_combiner(encoder_outputs):
+    # clean out unneeded encoder outputs
+    encoder_outputs = {}
+    encoder_outputs['feature_1'] = {
+        'encoder_output': tf.random.normal(
+            [128, 1],
+            dtype=tf.float32
+        )
+    }
+    encoder_outputs['feature_2'] = {
+        'encoder_output': tf.random.normal(
+            [128, 1],
+            dtype=tf.float32
+        )
+    }
+
+    input_features_def = [
+        {'name': 'feature_1', 'type': 'numerical'},
+        {'name': 'feature_2', 'type': 'numerical'}
+    ]
+
+    # setup combiner to test
+    combiner = TransformerCombiner(
+        input_features=input_features_def
+    )
+
+    # concatenate encoder outputs
+    results = combiner(encoder_outputs)
+
+    # required key present
+    assert 'combiner_output' in results

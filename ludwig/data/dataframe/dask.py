@@ -21,12 +21,17 @@ import os
 import dask
 import dask.array as da
 import dask.dataframe as dd
+from dask.diagnostics import ProgressBar
 
 from ludwig.constants import NAME, PROC_COLUMN
 from ludwig.data.dataset.parquet import ParquetDataset
+from ludwig.data.dataset.partitioned import PartitionedDataset
 from ludwig.data.dataframe.base import DataFrameEngine
-from ludwig.utils.data_utils import DATA_PROCESSED_CACHE_DIR, DATASET_SPLIT_URL
-from ludwig.utils.misc_utils import get_combined_features
+from ludwig.utils.data_utils import DATA_PROCESSED_CACHE_DIR, DATASET_SPLIT_URL, DATA_TRAIN_HDF5_FP
+from ludwig.utils.fs_utils import makedirs, to_url
+from ludwig.utils.misc_utils import get_combined_features, get_proc_features
+from ludwig.data.dataframe.dask_df_utils import dask_to_tfrecords
+
 
 TMP_COLUMN = '__TMP_COLUMN__'
 
@@ -36,8 +41,9 @@ def set_scheduler(scheduler):
 
 
 class DaskEngine(DataFrameEngine):
-    def __init__(self):
-        self._parallelism = multiprocessing.cpu_count()
+    def __init__(self, parallelism=None, persist=False, **kwargs):
+        self._parallelism = parallelism or multiprocessing.cpu_count()
+        self._persist = persist
 
     def set_parallelism(self, parallelism):
         self._parallelism = parallelism
@@ -52,7 +58,7 @@ class DaskEngine(DataFrameEngine):
         return data.repartition(self.parallelism)
 
     def persist(self, data):
-        return data.persist()
+        return data.persist() if self._persist else data
 
     def compute(self, data):
         return data.compute()
@@ -60,43 +66,34 @@ class DaskEngine(DataFrameEngine):
     def from_pandas(self, df):
         return dd.from_pandas(df, npartitions=self.parallelism)
 
-    def map_objects(self, series, map_fn):
-        return series.map(map_fn, meta=('data', 'object'))
+    def map_objects(self, series, map_fn, meta=None):
+        meta = meta or ('data', 'object')
+        return series.map(map_fn, meta=meta)
+
+    def apply_objects(self, df, apply_fn, meta=None):
+        meta = meta or ('data', 'object')
+        return df.apply(apply_fn, axis=1, meta=meta)
 
     def reduce_objects(self, series, reduce_fn):
         return series.reduction(reduce_fn, aggregate=reduce_fn, meta=('data', 'object')).compute()[0]
 
-    def create_dataset(self, dataset, tag, config, training_set_metadata):
-        cache_dir = training_set_metadata.get(DATA_PROCESSED_CACHE_DIR)
-        tag = tag.lower()
-        dataset_parquet_fp = os.path.join(cache_dir, f'{tag}.parquet')
+    def to_parquet(self, df, path):
+        with ProgressBar():
+            df.to_parquet(
+                path,
+                engine='pyarrow',
+                write_index=False,
+                schema='infer',
+            )
 
-        # Workaround for https://issues.apache.org/jira/browse/ARROW-1614
-        # Currently, Arrow does not support storing multi-dimensional arrays / tensors.
-        # When we write a column of tensors to disk, we need to first flatten it into a
-        # 1D array, which we will then reshape back when we read the data at train time.
-        features = get_combined_features(config)
-        for feature in features:
-            name = feature[NAME]
-            proc_column = feature[PROC_COLUMN]
-            reshape = training_set_metadata[name].get('reshape')
-            if reshape is not None:
-                dataset[proc_column] = self.map_objects(dataset[proc_column], lambda x: x.reshape(-1))
-
-        os.makedirs(dataset_parquet_fp, exist_ok=True)
-        dataset.to_parquet(dataset_parquet_fp,
-                           engine='pyarrow',
-                           write_index=False,
-                           schema='infer')
-
-        dataset_parquet_url = 'file://' + os.path.abspath(dataset_parquet_fp)
-        training_set_metadata[DATASET_SPLIT_URL.format(tag)] = dataset_parquet_url
-
-        return ParquetDataset(
-            dataset_parquet_url,
-            features,
-            training_set_metadata
-        )
+    def to_tfrecord(self, df, path):
+        """Implementations of data frame to tfrecords."""
+        with ProgressBar():
+            dask_to_tfrecords(
+                df,
+                path,
+                compression_type="GZIP",
+                compression_level=9)
 
     @property
     def array_lib(self):
@@ -107,9 +104,9 @@ class DaskEngine(DataFrameEngine):
         return dd
 
     @property
-    def use_hdf5_cache(self):
-        return False
-
-    @property
     def parallelism(self):
         return self._parallelism
+
+    @property
+    def partitioned(self):
+        return True

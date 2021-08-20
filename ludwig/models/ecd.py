@@ -2,7 +2,7 @@ import copy
 import logging
 from collections import OrderedDict
 
-import tensorflow as tf
+#import tensorflow as tf
 
 from ludwig.combiners.combiners import get_combiner_class
 from ludwig.constants import *
@@ -11,11 +11,16 @@ from ludwig.features.feature_registries import input_type_registry, \
 from ludwig.utils.algorithms_utils import topological_sort_feature_dependencies
 from ludwig.utils.data_utils import clear_data_cache
 from ludwig.utils.misc_utils import get_from_registry
+from ludwig.utils.torch_utils import LudwigModule
+
+import torch
+from torch.nn import Module
+import torchmetrics
 
 logger = logging.getLogger(__name__)
 
 
-class ECD(tf.keras.Model):
+class ECD(LudwigModule):
 
     def __init__(
             self,
@@ -33,14 +38,19 @@ class ECD(tf.keras.Model):
         self._random_seed = random_seed
 
         if random_seed is not None:
-            tf.random.set_seed(random_seed)
+            #tf.random.set_seed(random_seed)
+            torch.random.manual_seed(random_seed)
 
         super().__init__()
 
         # ================ Inputs ================
+        '''
         self.input_features = build_inputs(
             input_features_def
         )
+        '''
+        self.input_features = torch.nn.ModuleDict()
+        self.input_features.update(build_inputs(input_features_def))
 
         # ================ Combiner ================
         logger.debug('Combiner {}'.format(combiner_def[TYPE]))
@@ -51,13 +61,18 @@ class ECD(tf.keras.Model):
         )
 
         # ================ Outputs ================
+        '''
         self.output_features = build_outputs(
             output_features_def,
             self.combiner
         )
+        '''
+        self.output_features = torch.nn.ModuleDict()
+        self.output_features.update(build_outputs(output_features_def, self.combiner))
 
         # ================ Combined loss metric ================
-        self.eval_loss_metric = tf.keras.metrics.Mean()
+        #self.eval_loss_metric = tf.keras.metrics.Mean()
+        self.eval_loss_metric = torchmetrics.average.AverageMeter()
 
         # After constructing all layers, clear the cache to free up memory
         clear_data_cache()
@@ -80,16 +95,18 @@ class ECD(tf.keras.Model):
         }
         return inputs, targets
 
+    '''
     def get_connected_model(self, training=True, inputs=None):
         inputs = inputs or self.get_model_inputs(training)
         outputs = self.call(inputs)
         return tf.keras.Model(inputs=inputs, outputs=outputs)
+    '''
 
     def save_savedmodel(self, save_path):
         keras_model = self.get_connected_model(training=False)
         keras_model.save(save_path)
 
-    def call(self, inputs, training=None, mask=None):
+    def forward(self, inputs, training=None, mask=None):
         # parameter inputs is a dict feature_name -> tensor / ndarray
         # or
         # parameter (inputs, targets) where
@@ -98,9 +115,14 @@ class ECD(tf.keras.Model):
 
         if isinstance(inputs, tuple):
             inputs, targets = inputs
+            for target_feature_name, target_value in targets.items():
+                targets[target_feature_name] = torch.from_numpy(target_value)
+                # inputs dict is converted to tensor in loop below
         else:
             targets = None
         assert inputs.keys() == self.input_features.keys()
+        for input_feature_name, input_values in inputs.items():
+            inputs[input_feature_name] = torch.from_numpy(input_values)
 
         encoder_outputs = {}
         for input_feature_name, input_values in inputs.items():
@@ -165,7 +187,8 @@ class ECD(tf.keras.Model):
                 "of output features"
             )
 
-        outputs = self.call(inputs, training=False)
+        #outputs = self.call(inputs, training=False)
+        outputs = self(inputs, training=False)
 
         predictions = {}
         for of_name in of_list:
@@ -176,28 +199,32 @@ class ECD(tf.keras.Model):
 
         return predictions
 
-    @tf.function
+    #@tf.function
     def train_step(self, optimizer, inputs, targets,
                    regularization_lambda=0.0):
-        with tf.GradientTape() as tape:
-            model_outputs = self((inputs, targets), training=True)
-            loss, all_losses = self.train_loss(
-                targets, model_outputs, regularization_lambda
-            )
+        #with tf.GradientTape() as tape:
+        optimizer.zero_grad()
+        model_outputs = self((inputs, targets), training=True)
+        loss, all_losses = self.train_loss(
+            targets, model_outputs, regularization_lambda
+        )
+        '''
         optimizer.minimize_with_tape(
             tape, loss, self.trainable_variables
         )
+        '''
+        optimizer.minimize(loss, self.parameters())
         # grads = tape.gradient(loss, model.trainable_weights)
         # optimizer.apply_gradients(zip(grads, model.trainable_weights))
         return loss, all_losses
 
-    @tf.function
+    #@tf.function
     def evaluation_step(self, inputs, targets):
         predictions = self.predictions(inputs, output_features=None)
         self.update_metrics(targets, predictions)
         return predictions
 
-    @tf.function
+    #@tf.function
     def predict_step(self, inputs):
         return self.predictions(inputs, output_features=None)
 
@@ -209,8 +236,17 @@ class ECD(tf.keras.Model):
                                               predictions[of_name])
             train_loss += of_obj.loss['weight'] * of_train_loss
             of_train_losses[of_name] = of_train_loss
-        train_loss += regularization_lambda * sum(
-            self.losses)  # regularization / other losses
+
+        for loss in self.losses():
+            if hasattr(loss, "loss_name"):
+                # this assumes that all losses with a loss_name are not
+                # regularization losses and should be added
+                # to the total loss as they are
+                train_loss += loss
+            else:
+                # this assumes all unnamed losses are regularization losses
+                train_loss += regularization_lambda * loss
+
         return train_loss, of_train_losses
 
     def eval_loss(self, targets, predictions):
@@ -222,13 +258,18 @@ class ECD(tf.keras.Model):
             )
             eval_loss += of_obj.loss['weight'] * of_eval_loss
             of_eval_losses[of_name] = of_eval_loss
-        eval_loss += sum(self.losses)  # regularization / other losses
+        eval_loss += sum(self.losses())  # regularization / other losses
         return eval_loss, of_eval_losses
 
     def update_metrics(self, targets, predictions):
         for of_name, of_obj in self.output_features.items():
             of_obj.update_metrics(targets[of_name], predictions[of_name])
+        '''
         self.eval_loss_metric.update_state(
+            self.eval_loss(targets, predictions)[0]
+        )
+        '''
+        self.eval_loss_metric.update(
             self.eval_loss(targets, predictions)[0]
         )
 
@@ -237,14 +278,16 @@ class ECD(tf.keras.Model):
         for of_name, of_obj in self.output_features.items():
             all_of_metrics[of_name] = of_obj.get_metrics()
         all_of_metrics[COMBINED] = {
-            LOSS: self.eval_loss_metric.result().numpy()
+            #LOSS: self.eval_loss_metric.result().numpy()
+            LOSS: self.eval_loss_metric.compute().detach().numpy().item()
         }
         return all_of_metrics
 
     def reset_metrics(self):
         for of_obj in self.output_features.values():
             of_obj.reset_metrics()
-        self.eval_loss_metric.reset_states()
+        #self.eval_loss_metric.reset_states()
+        self.eval_loss_metric.reset()
 
     def collect_weights(
             self,
@@ -253,17 +296,26 @@ class ECD(tf.keras.Model):
     ):
         def recurse_weights(model, prefix=None):
             results = []
-            for layer in model.layers:
-                layer_prefix = f'{prefix}/{layer.name}' if prefix else layer.name
-                if isinstance(layer, tf.keras.Model):
-                    results += recurse_weights(layer, layer_prefix)
-                else:
-                    results += [(f'{layer_prefix}/{w.name}', w) for w in
-                                layer.weights]
+            #for layer in model.layers:
+            for name, layer in model.named_children():
+                #layer_prefix = f'{prefix}/{layer.name}' if prefix else layer.name
+                layer_prefix = f'{prefix}/{name}' if prefix else name
+                #if isinstance(layer, tf.keras.Model):
+                if isinstance(layer, Module):
+                    if list(layer.children()):
+                        results += recurse_weights(layer, layer_prefix)
+                    else:
+                        '''
+                        results += [(f'{layer_prefix}/{w.name}', w) for w in
+                                    layer.weights]
+                        '''
+                        results += [(f'{layer_prefix}/{w_name}', w) for w_name, w in
+                                    layer.named_parameters()]
             return results
 
-        connected_model = self.get_connected_model()
-        weights = recurse_weights(connected_model)
+        #connected_model = self.get_connected_model()
+        #weights = recurse_weights(connected_model)
+        weights = recurse_weights(self)
         if tensor_names:
             # Check for bad tensor names
             weight_set = set(name for name, w in weights)
@@ -278,13 +330,19 @@ class ECD(tf.keras.Model):
 
         return weights
 
+    def get_args(self):
+        return self._input_features_df, self._combiner_def, self._output_features_df, self._random_seed
+
     def __setstate__(self, newstate):
         self.set_weights(newstate['weights'])
 
+    '''
     def __reduce__(self):
-        args = (self._input_features_df, self._combiner_def, self._output_features_df, self._random_seed)
-        state = {'weights': self.get_weights()}
+        args = self.get_args()
+        #state = {'weights': self.get_weights()}
+        state = {'weights': list(self.parameters())}
         return ECD, args, state
+    '''
 
 
 def build_inputs(
@@ -341,6 +399,7 @@ def build_outputs(
     output_features = {}
 
     for output_feature_def in output_features_def:
+        output_feature_def["input_size"] = combiner.get_output_shape()
         output_feature = build_single_output(
             output_feature_def,
             combiner,

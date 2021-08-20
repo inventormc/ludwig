@@ -19,9 +19,10 @@ import os.path
 import pytest
 
 from ludwig.hyperopt.execution import get_build_hyperopt_executor
+from ludwig.hyperopt.results import HyperoptResults
 from ludwig.hyperopt.run import hyperopt
 from ludwig.hyperopt.sampling import (get_build_hyperopt_sampler)
-from ludwig.hyperopt.utils import update_hyperopt_params_with_defaults
+from ludwig.hyperopt.run import update_hyperopt_params_with_defaults
 from ludwig.utils.defaults import merge_with_defaults, ACCURACY
 from ludwig.utils.tf_utils import get_available_gpus_cuda_string
 from tests.integration_tests.utils import category_feature
@@ -88,6 +89,10 @@ EXECUTORS = [
 def test_hyperopt_executor(sampler, executor, csv_filename,
                            validate_output_feature=False,
                            validation_metric=None):
+    if executor['type'] == 'fiber' and sampler['type'] == 'grid':
+        # This test is very slow and doesn't give us additional converage
+        pytest.skip('Skipping Fiber grid search')
+
     input_features = [
         text_feature(name="utterance", cell_type="lstm", reduce_output="sum"),
         category_feature(vocab_size=2, reduce_input="sum")]
@@ -209,7 +214,7 @@ def test_hyperopt_run_hyperopt(csv_filename, samplers):
     )
 
     # check for return results
-    assert isinstance(hyperopt_results, list)
+    assert isinstance(hyperopt_results, HyperoptResults)
 
     # check for existence of the hyperopt statistics file
     assert os.path.isfile(
